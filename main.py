@@ -1,25 +1,30 @@
 import re
-import httpx
+from curl_cffi.requests import AsyncSession
 from bs4 import BeautifulSoup
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 
 BASE = "https://cinesubz.co"
-HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36",
-    "Accept-Language": "en-US,en;q=0.9,si;q=0.8",
-}
+IMPERSONATE = "chrome124"   # Chrome 124 browser fingerprint
 
-app = FastAPI(title="CineSubz Unofficial API", version="1.1")
+app = FastAPI(title="CineSubz Unofficial API", version="2.0")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
-client = httpx.AsyncClient(headers=HEADERS, timeout=20, follow_redirects=True)
+# httpx වෙනුවට curl_cffi — Cloudflare TLS fingerprint check bypass
+session = AsyncSession(impersonate=IMPERSONATE, timeout=25)
 
-def soup_of(html): return BeautifulSoup(html, "lxml")
+async def fetch(url: str, **kwargs) -> str:
+    r = await session.get(url, headers={"Accept-Language": "en-US,en;q=0.9,si;q=0.8"}, **kwargs)
+    if r.status_code == 403:
+        raise HTTPException(502, "Cloudflare block — retry කරන්න හෝ proxy එකක් අවශ්‍යයි")
+    r.raise_for_status()
+    return r.text
 
-# ---------- NEW FALLBACK PARSER (class names නොබලා වැඩ කරනවා) ----------
-def parse_listing(html: str) -> list[dict]:
+def soup_of(html):
+    return BeautifulSoup(html, "lxml")
+
+def parse_listing(html: str) -> list:
     s = soup_of(html)
     items, seen = [], set()
     for h in s.find_all(["h2", "h3"]):
@@ -55,75 +60,64 @@ def get_pagination(s):
             nums.append(int(m.group(1)))
     return {"last_page": max(nums) if nums else 1}
 
-# ---------- DEBUG ----------
 @app.get("/debug")
 async def debug(path: str = "/movies/"):
-    r = await client.get(BASE + path)
-    s = soup_of(r.text)
+    try:
+        html = await fetch(BASE + path)
+    except HTTPException:
+        raise
+    s = soup_of(html)
     classes = sorted({c for tag in s.find_all(True) for c in (tag.get("class") or [])})
-    h2h3 = [h.get_text(strip=True)[:50] for h in s.find_all(["h2", "h3"])][:10]
-    return {"status": r.status_code, "html_len": len(r.text),
+    h2h3 = [h.get_text(strip=True)[:60] for h in s.find_all(["h2", "h3"])][:10]
+    cf_block = "Just a moment" in html or "challenge" in html.lower()[:2000]
+    return {"status": 200, "html_len": len(html), "cloudflare_block": cf_block,
             "classes": classes[:60], "headings": h2h3}
 
 @app.get("/")
 async def index():
-    return {"endpoints": ["/home", "/movies?page=", "/tvshows?page=",
-            "/genre/{g}?page=", "/search?query=", "/detail?url=", "/download?url=", "/debug"]}
+    return {"version": "2.0 (curl_cffi)", "endpoints": ["/home", "/movies?page=", "/tvshows?page=", "/genre/{g}", "/search?query=", "/detail?url=", "/download?url=", "/debug"]}
 
 @app.get("/home")
 async def home():
-    r = await client.get(BASE)
-    r.raise_for_status()
-    return {"results": parse_listing(r.text)}
+    return {"results": parse_listing(await fetch(BASE))}
 
 @app.get("/movies")
 async def movies(page: int = 1):
     url = f"{BASE}/movies/" if page == 1 else f"{BASE}/movies/page/{page}/"
-    r = await client.get(url)
-    r.raise_for_status()
-    s = soup_of(r.text)
-    return {"page": page, **get_pagination(s), "results": parse_listing(r.text)}
+    html = await fetch(url)
+    return {"page": page, **get_pagination(soup_of(html)), "results": parse_listing(html)}
 
 @app.get("/tvshows")
 async def tvshows(page: int = 1):
     url = f"{BASE}/tvshows/" if page == 1 else f"{BASE}/tvshows/page/{page}/"
-    r = await client.get(url)
-    r.raise_for_status()
-    s = soup_of(r.text)
-    return {"page": page, **get_pagination(s), "results": parse_listing(r.text)}
+    html = await fetch(url)
+    return {"page": page, **get_pagination(soup_of(html)), "results": parse_listing(html)}
 
 @app.get("/genre/{genre}")
 async def genre(genre: str, page: int = 1):
     url = f"{BASE}/genre/{genre}/" if page == 1 else f"{BASE}/genre/{genre}/page/{page}/"
-    r = await client.get(url)
-    if r.status_code == 404:
-        raise HTTPException(404, f"Genre '{genre}' not found")
-    r.raise_for_status()
-    return {"page": page, "results": parse_listing(r.text)}
+    return {"page": page, "results": parse_listing(await fetch(url))}
 
 @app.get("/search")
 async def search(query: str = Query(..., min_length=1)):
-    r = await client.get(f"{BASE}/", params={"s": query})
-    r.raise_for_status()
-    return {"query": query, "results": parse_listing(r.text)}
+    html = await session.get(f"{BASE}/", params={"s": query})  # params support
+    return {"query": query, "results": parse_listing(html.text)}
 
 @app.get("/detail")
 async def detail(url: str):
     if not url.startswith("http"):
         url = BASE + "/" + url.lstrip("/")
-    r = await client.get(url)
-    r.raise_for_status()
-    s = soup_of(r.text)
+    s = soup_of(await fetch(url))
     title = s.select_one("h1")
-    poster = s.select_one(".poster img, .single-poster img, .dtinfo img, .imdbwp img") or s.select_one("img")
-    desc = s.select_one(".wp-content p, .description, .sinopsis") 
+    poster = s.select_one(".poster img, .dtinfo img, .imdbwp img") or s.select_one("img")
+    desc = s.select_one(".wp-content p, .description, .sinopsis")
     if not desc:
         for p in s.find_all("p"):
             if len(p.get_text(strip=True)) > 60:
                 desc = p
                 break
     sub_links = [{"text": a.get_text(strip=True), "url": a["href"]}
-                 for a in s.select("a[href]") 
+                 for a in s.select("a[href]")
                  if a.get("href") and (".srt" in a["href"] or "download" in a["href"].lower())]
     return {
         "url": url,
@@ -137,7 +131,7 @@ async def detail(url: str):
 async def download(url: str):
     if not url.startswith("http"):
         url = BASE + "/" + url.lstrip("/")
-    r = await client.get(url)
+    r = await session.get(url)
     r.raise_for_status()
     ct = r.headers.get("content-type", "application/octet-stream")
     fname = url.split("/")[-1].split("?")[0] or "subtitle.srt"
